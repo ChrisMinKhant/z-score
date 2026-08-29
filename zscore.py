@@ -5,19 +5,18 @@ import yfinance as yf
 
 # ==========================================
 # TELEGRAM CONFIGURATION
-# Replace these strings with your active credentials
 # ==========================================
 TELEGRAM_BOT_TOKEN = "8485387101:AAGqURFlJTFUexDEU9-DmQnG-j9wbuxDdRU"
 TELEGRAM_CHAT_ID = "1199956672"
 
 
-def send_telegram_alert(message):
+def send_telegram_alert(message: str):
     """Dispatches a formatted text notification via the Telegram Bot API."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown",  # Allows bolding and code blocks in alerts
+        "parse_mode": "Markdown",
     }
 
     try:
@@ -27,120 +26,232 @@ def send_telegram_alert(message):
         else:
             print(f"✗ Telegram dispatch failed. Status Code: {response.status_code}")
     except Exception as e:
-        print(f"✗ Network failure connection to Telegram: {e}")
+        print(f"✗ Network failure connecting to Telegram: {e}")
 
 
-def analyze_mean_reversion(ticker, account_balance, risk_pct=0.02, lookback=20, interval="1h"):
-    print(f"Analyzing {ticker} using Statistical Mean Reversion...")
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Wilder's Smoothed Average True Range (ATR)."""
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"].shift(1)
 
-    # Fetch 3 months of data to ensure we have enough bars to calculate the 200 MA on both 1h and 4h intervals
-    df = yf.download(ticker, period="3mo", interval=interval)
-    if df.empty:
-        print(f"✗ Failed to download data for {ticker}.")
+    tr1 = high - low
+    tr2 = (high - close).abs()
+    tr3 = (low - close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Wilder's Average Directional Index (ADX) to filter trending regimes."""
+    high = df["High"]
+    low = df["Low"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = calculate_atr(df, period)
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / tr)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / tr)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx
+
+
+def analyze_mean_reversion(
+    ticker: str,
+    account_balance: float = 200.00,
+    risk_pct: float = 0.02,
+    lookback: int = 20,
+    interval: str = "1h",
+    max_leverage: float = 10.0,
+    min_stop_pips: float = 18.0,
+    max_adx: float = 25.0,
+    use_reversal_hook: bool = True,
+):
+    """
+    Institutional Quantitative Statistical Mean Reversion Engine.
+
+    Key Safeguards & Optimizations:
+    1. Reversal Hook: Confirms momentum exhaustion before entry (prevents falling-knife entries).
+    2. Dynamic ATR Stops with Hard Pip Floor: Eliminates micro-pip stop outs and over-leveraged lots.
+    3. Max Account Leverage Cap: Constrains lot size to prevent excessive margin exposure.
+    4. ADX Regime Filter: Blocks mean reversion during strong trending/breakout regimes (ADX >= 25).
+    5. Daily HTF Trend Filter: Aligns trades with the higher-timeframe macro trend (50 Daily EMA).
+    """
+    print(f"\n==================================================")
+    print(f"Analyzing {ticker} [Optimized Quantitative Engine]")
+    print(f"==================================================")
+
+    # 1. Fetch primary execution timeframe data (1H)
+    df = yf.download(ticker, period="3mo", interval=interval, progress=False)
+    if df.empty or len(df) < (lookback + 50):
+        print(f"✗ Failed or insufficient data for {ticker}.")
         return
 
-    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+    # Flatten column MultiIndex if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
 
-    # Calculate indicators
+    # 2. Fetch Higher Timeframe (HTF) Daily data for Macro Trend Filter (50 EMA)
+    df_daily = yf.download(ticker, period="6mo", interval="1d", progress=False)
+    if isinstance(df_daily.columns, pd.MultiIndex):
+        df_daily.columns = [col[0] for col in df_daily.columns]
+
+    if len(df_daily) >= 50:
+        df_daily["EMA_50"] = df_daily["Close"].ewm(span=50, adjust=False).mean()
+        htf_bullish = bool(df_daily["Close"].iloc[-1] > df_daily["EMA_50"].iloc[-1])
+        htf_ema50_val = float(df_daily["EMA_50"].iloc[-1])
+    else:
+        htf_bullish = None
+        htf_ema50_val = None
+
+    # 3. Calculate Primary Indicators
     df["Rolling_Mean"] = df["Close"].rolling(window=lookback).mean()
     df["Rolling_Std"] = df["Close"].rolling(window=lookback).std()
     df["Z_Score"] = (df["Close"] - df["Rolling_Mean"]) / df["Rolling_Std"]
-    df["MA_200"] = df["Close"].rolling(window=200).mean()
+    df["ATR"] = calculate_atr(df, period=14)
+    df["ADX"] = calculate_adx(df, period=14)
 
     latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
     current_price = float(latest["Close"])
-    z_score = float(latest["Z_Score"])
-    rolling_std = float(latest["Rolling_Std"])
-    ma_200 = float(latest["MA_200"]) if not pd.isna(latest["MA_200"]) else None
+    curr_z = float(latest["Z_Score"])
+    prev_z = float(prev["Z_Score"])
+    rolling_mean = float(latest["Rolling_Mean"])
+    atr_val = float(latest["ATR"])
+    adx_val = float(latest["ADX"]) if not pd.isna(latest["ADX"]) else 20.0
 
-    # Trend filter verification
-    # Only take buy signals if the current price is above the 200 MA
-    # Only take sell signals if the current price is below the 200 MA
-    is_above_ma200 = ma_200 is None or current_price > ma_200
-    is_below_ma200 = ma_200 is None or current_price < ma_200
+    pip_size = 0.01 if "JPY" in ticker else 0.0001
+    atr_pips = atr_val / pip_size
 
-    # Evaluate Signals
-    if z_score <= -2.0:
-        if not is_above_ma200:
-            print(f"Current Z-Score: {z_score:.2f} (Oversold). BUY blocked by Trend Filter (Price {current_price:.5f} <= MA 200 {ma_200:.5f}).")
-            return
-        signal = "🔵 BUY (Oversold Mean Reversion)"
-        entry_price = current_price
-        stop_loss = df["Rolling_Mean"].iloc[-1] - (3.0 * rolling_std)
-        take_profit = float(df["Rolling_Mean"].iloc[-1])
-    elif z_score >= 2.0:
-        if not is_below_ma200:
-            print(f"Current Z-Score: {z_score:.2f} (Overbought). SELL blocked by Trend Filter (Price {current_price:.5f} >= MA 200 {ma_200:.5f}).")
-            return
-        signal = "🔴 SELL (Overbought Mean Reversion)"
-        entry_price = current_price
-        stop_loss = df["Rolling_Mean"].iloc[-1] + (3.0 * rolling_std)
-        take_profit = float(df["Rolling_Mean"].iloc[-1])
-    else:
-        print(f"Current Z-Score: {z_score:.2f}. Market within normal range.")
+    print(f"Price: {current_price:.5f} | Z-Score: {curr_z:.2f} (Prev: {prev_z:.2f})")
+    print(f"ADX (14): {adx_val:.1f} | ATR (14): {atr_pips:.1f} pips | HTF Daily Trend: {'Bullish' if htf_bullish else 'Bearish' if htf_bullish is False else 'N/A'}")
+
+    # 4. Regime Filter: Block if market is strongly trending (ADX >= max_adx)
+    if adx_val >= max_adx:
+        print(f"⏸ TRADE BLOCKED: Market is in a Strong Trend Regime (ADX = {adx_val:.1f} >= {max_adx}).")
         return
 
-    # Pip configuration
-    pip_size = 0.01 if "JPY" in ticker else 0.0001
-    
-    # Calculate standard lot pip value in USD (assuming USD account)
+    # 5. Signal Evaluation
+    is_buy = False
+    is_sell = False
+
+    if use_reversal_hook:
+        # Reversal Hook: Confirms price was stretched and is now snapping back
+        if prev_z <= -2.0 and curr_z > -2.0:
+            is_buy = True
+        elif prev_z >= 2.0 and curr_z < 2.0:
+            is_sell = True
+    else:
+        # Standard threshold
+        if curr_z <= -2.0:
+            is_buy = True
+        elif curr_z >= 2.0:
+            is_sell = True
+
+    # 6. Apply HTF Trend Filter & Generate Orders
+    if is_buy:
+        if htf_bullish is False:
+            print(f"⏸ BUY BLOCKED by HTF Trend Filter (Price below Daily 50 EMA {htf_ema50_val:.5f}).")
+            return
+        signal = "🔵 BUY (Mean Reversion Hook)"
+        entry_price = current_price
+
+        # Stop Loss: Maximum of 1.5x ATR or minimum pip buffer (prevents micro-stops)
+        sl_distance = max(1.5 * atr_val, min_stop_pips * pip_size)
+        stop_loss = entry_price - sl_distance
+
+        # Take Profit: Target the mean, ensuring minimum 1.5 R:R
+        min_tp_target = entry_price + (1.5 * sl_distance)
+        take_profit = max(rolling_mean, min_tp_target)
+
+    elif is_sell:
+        if htf_bullish is True:
+            print(f"⏸ SELL BLOCKED by HTF Trend Filter (Price above Daily 50 EMA {htf_ema50_val:.5f}).")
+            return
+        signal = "🔴 SELL (Mean Reversion Hook)"
+        entry_price = current_price
+
+        sl_distance = max(1.5 * atr_val, min_stop_pips * pip_size)
+        stop_loss = entry_price + sl_distance
+
+        min_tp_target = entry_price - (1.5 * sl_distance)
+        take_profit = min(rolling_mean, min_tp_target)
+
+    else:
+        print(f"⏸ No Actionable Signal: Z-Score ({curr_z:.2f}) within normal range.")
+        return
+
+    # 7. Accurate Pip Value per Standard Lot
     if "JPY" in ticker:
-        # Standard lot pip value in JPY is 1,000 JPY. Convert to USD using the USDJPY exchange rate.
         if ticker.startswith("USD"):
             standard_lot_pip_value = 1000.0 / current_price
         else:
             try:
-                # Fetch USDJPY rate to convert JPY-denominated pip value to USD
-                usdjpy_price = float(yf.download("USDJPY=X", period="1d")["Close"].iloc[-1])
+                usdjpy_price = float(yf.download("USDJPY=X", period="1d", progress=False)["Close"].iloc[-1])
                 standard_lot_pip_value = 1000.0 / usdjpy_price
             except Exception:
-                standard_lot_pip_value = 6.67 # Fallback approximation (assuming USDJPY ~ 150)
+                standard_lot_pip_value = 6.67
+    elif "CAD" in ticker and ticker.startswith("USD"):
+        standard_lot_pip_value = 10.0 / current_price
     else:
         standard_lot_pip_value = 10.0
 
-    # Position Sizing
-    stop_loss_distance = abs(entry_price - stop_loss)
-    pips_at_risk = stop_loss_distance / pip_size
+    # 8. Institutional Position Sizing with Leverage Cap
+    pips_at_risk = abs(entry_price - stop_loss) / pip_size
     cash_at_risk = account_balance * risk_pct
 
-    # Formula Correction: Raw lot size is cash_at_risk divided by (pips_at_risk * standard_lot_pip_value).
-    # The previous formula incorrectly multiplied by pip_size in the denominator, inflating the lot size by 10,000x.
+    # Calculate risk-based lot size
     raw_lot_size = cash_at_risk / (pips_at_risk * standard_lot_pip_value)
-    calculated_lots = np.floor(raw_lot_size * 100) / 100
+
+    # Calculate maximum permissible lots based on account leverage ceiling
+    max_allowed_lots = (account_balance * max_leverage) / 100000.0
+
+    # Final lot sizing: Constrained by risk and max leverage
+    calculated_lots = min(raw_lot_size, max_allowed_lots)
+    calculated_lots = max(round(calculated_lots, 2), 0.01)
+
+    actual_risk_dollars = pips_at_risk * calculated_lots * standard_lot_pip_value
+    effective_leverage = (calculated_lots * 100000.0) / account_balance
+    reward_pips = abs(take_profit - entry_price) / pip_size
+    rr_ratio = reward_pips / pips_at_risk if pips_at_risk > 0 else 0.0
 
     print(
-        f"Signal: {calculated_lots:.2f} Lots | Risk: ${cash_at_risk:.2f} | Pips at Risk: {pips_at_risk:.1f}"
+        f"✓ Valid Signal: {signal} | Lots: {calculated_lots:.2f} | Leverage: {effective_leverage:.1f}x | "
+        f"SL: {pips_at_risk:.1f} pips | TP: {reward_pips:.1f} pips | R:R: {rr_ratio:.2f} | Risk: ${actual_risk_dollars:.2f}"
     )
 
-    if calculated_lots < 0.01:
-        calculated_lots = 0.01
-        # Formula Correction: Actual risk is pips_at_risk * calculated_lots * standard_lot_pip_value.
-        actual_risk = pips_at_risk * calculated_lots * standard_lot_pip_value
-        risk_status = f"⚠️ Risk expands to ${actual_risk:.2f} ({(actual_risk/account_balance)*100:.1f}%) due to min lot rules."
-    else:
-        risk_status = "✓ Risk matches safe portfolio parameters."
-
-    # Build clean Telegram markdown message
+    # 9. Format Telegram Markdown Alert
     pair_clean = ticker.replace("=X", "")
-    ma_200_str = f"{ma_200:.5f}" if ma_200 is not None else "N/A"
-    
+    htf_str = f"Bullish (Above Daily EMA 50: {htf_ema50_val:.5f})" if htf_bullish else f"Bearish (Below Daily EMA 50: {htf_ema50_val:.5f})" if htf_bullish is False else "N/A"
+
     tg_message = (
-        f"📊 *TRADE EXECUTION SIGNAL*\n"
+        f"📊 *OPTIMIZED QUANT TRADE SIGNAL*\n"
         f"=============================\n"
         f"*Pair:* `{pair_clean}`\n"
         f"*Action:* {signal}\n"
-        f"*Z-Score:* `{z_score:.2f}`\n"
-        f"*MA 200:* `{ma_200_str}`\n"
+        f"*Z-Score:* `{curr_z:.2f}` (Hook from `{prev_z:.2f}`)\n"
+        f"*Market Regime:* Ranging (ADX: `{adx_val:.1f}` < {max_adx})\n"
+        f"*HTF Trend:* `{htf_str}`\n"
         f"-----------------------------\n"
-        f"🎯 *Entry Limit:* `{entry_price:.5f}`\n"
+        f"🎯 *Entry:* `{entry_price:.5f}`\n"
         f"🛑 *Stop Loss:* `{stop_loss:.5f}` ({pips_at_risk:.1f} pips)\n"
-        f"🏁 *Take Profit:* `{take_profit:.5f}`\n"
+        f"🏁 *Take Profit:* `{take_profit:.5f}` ({reward_pips:.1f} pips)\n"
+        f"⚖️ *Risk/Reward:* `1 : {rr_ratio:.2f}`\n"
         f"-----------------------------\n"
         f"📦 *Position Size:* `{calculated_lots:.2f} Lots`\n"
-        f"💵 *Allotted Risk:* `${cash_at_risk:.2f}`\n"
-        f"🛡️ *Safety Check:* {risk_status}\n"
+        f"💵 *Dollar Risk:* `${actual_risk_dollars:.2f}` ({(actual_risk_dollars/account_balance)*100:.1f}%)\n"
+        f"🛡️ *Effective Leverage:* `{effective_leverage:.1f}x` (Max: `{max_leverage:.0f}x`)\n"
         f"============================="
     )
 
-    # Dispatch to device
+    # Dispatch to Telegram
     send_telegram_alert(tg_message)
+
